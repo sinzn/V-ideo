@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Group Call</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+  <center>
+    <h2>Group Audio Video Call</h2>
+    <input id="room" placeholder="Enter group name">
+    <button onclick="joinRoom()">Join</button>
+    <br><br>
+
+    <video id="myVideo" autoplay muted playsinline width="300" height="220"></video>
+    <br>
+    <button id="videoBtn" onclick="toggleVideo()">Turn Off Video</button>
+    <button id="audioBtn" onclick="toggleAudio()">Turn Off Audio</button>
+    <button onclick="leaveCall()">Leave Call</button>
+    <br><br>
+    <button id="switchCameraBtn" onclick="switchCamera()">Switch Camera</button>
+    <br><br>
+
+    <h3>Participants: <span id="count">1</span></h3>
+    <table id="videosTable" border="0" cellspacing="10" cellpadding="0"></table>
+  </center>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    let localStream;
+    let peers = {};
+    const myVideo = document.getElementById('myVideo');
+    const videoBtn = document.getElementById('videoBtn');
+    const audioBtn = document.getElementById('audioBtn');
+    const countSpan = document.getElementById('count');
+    const videosTable = document.getElementById('videosTable');
+    const switchCameraBtn = document.getElementById('switchCameraBtn');
+    let roomId = "";
+    let currentStream;
+    let currentVideoDeviceId = null;
+
+    // Hide switch camera button on web view (desktop)
+    function checkDeviceType() {
+      if (window.innerWidth <= 768) {
+        switchCameraBtn.style.display = 'inline-block'; // Show for mobile view
+      } else {
+        switchCameraBtn.style.display = 'none'; // Hide for desktop view
+      }
+    }
+
+    // Call this on load and on window resize
+    window.onload = checkDeviceType;
+    window.onresize = checkDeviceType;
+
+    async function joinRoom() {
+      roomId = document.getElementById('room').value;
+      if (!roomId) return alert("Enter room name");
+
+      // Initialize the camera (either front/back)
+      await startStream();
+      socket.emit('join-room', roomId);
+    }
+
+    async function startStream() {
+      const constraints = {
+        video: { deviceId: currentVideoDeviceId ? { exact: currentVideoDeviceId } : undefined },
+        audio: true
+      };
+      currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+      myVideo.srcObject = currentStream;
+    }
+
+    function toggleVideo() {
+      const videoTrack = currentStream.getVideoTracks()[0];
+      videoTrack.enabled = !videoTrack.enabled;
+      videoBtn.innerText = videoTrack.enabled ? "Turn Off Video" : "Turn On Video";
+    }
+
+    function toggleAudio() {
+      const audioTrack = currentStream.getAudioTracks()[0];
+      audioTrack.enabled = !audioTrack.enabled;
+      audioBtn.innerText = audioTrack.enabled ? "Turn Off Audio" : "Turn On Audio";
+    }
+
+    function leaveCall() {
+      for (let id in peers) {
+        peers[id].close();
+        removeRemoteVideo(id);
+      }
+      peers = {};
+      if (currentStream) {
+        currentStream.getTracks().forEach(track => track.stop());
+        myVideo.srcObject = null;
+      }
+      socket.emit('leave-room', roomId);
+    }
+
+    function addRemoteVideo(userId, stream) {
+      if (document.getElementById(userId)) return;
+      const video = document.createElement('video');
+      video.id = userId;
+      video.srcObject = stream;
+      video.autoplay = true;
+      video.playsInline = true;
+      video.width = 300;
+      video.height = 220;
+
+      const cell = document.createElement('td');
+      cell.appendChild(video);
+
+      let row = videosTable.rows[videosTable.rows.length - 1];
+      if (!row || row.cells.length >= 2) {
+        row = videosTable.insertRow();
+      }
+      row.appendChild(cell);
+
+      updateCount();
+    }
+
+    function removeRemoteVideo(userId) {
+      const video = document.getElementById(userId);
+      if (video) {
+        const cell = video.parentNode;
+        const row = cell.parentNode;
+        row.removeChild(cell);
+        if (row.cells.length === 0) {
+          videosTable.deleteRow(row.rowIndex);
+        }
+      }
+      updateCount();
+    }
+
+    function updateCount() {
+      countSpan.innerText = 1 + Object.keys(peers).length;
+    }
+
+    socket.on('user-connected', (userId) => {
+      const peer = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+
+      currentStream.getTracks().forEach(track => peer.addTrack(track, currentStream));
+
+      peer.onicecandidate = (e) => {
+        if (e.candidate) {
+          socket.emit('signal', {
+            to: userId,
+            signal: { candidate: e.candidate }
+          });
+        }
+      };
+
+      peer.ontrack = (e) => {
+        addRemoteVideo(userId, e.streams[0]);
+      };
+
+      peer.createOffer().then(offer => {
+        peer.setLocalDescription(offer);
+        socket.emit('signal', {
+          to: userId,
+          signal: { sdp: offer }
+        });
+      });
+
+      peers[userId] = peer;
+      updateCount();
+    });
+
+    socket.on('signal', async (data) => {
+      let peer = peers[data.from];
+      if (!peer) {
+        peer = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
+        currentStream.getTracks().forEach(track => peer.addTrack(track, currentStream));
+
+        peer.onicecandidate = (e) => {
+          if (e.candidate) {
+            socket.emit('signal', {
+              to: data.from,
+              signal: { candidate: e.candidate }
+            });
+          }
+        };
+
+        peer.ontrack = (e) => {
+          addRemoteVideo(data.from, e.streams[0]);
+        };
+
+        peers[data.from] = peer;
+        updateCount();
+      }
+
+      if (data.signal.sdp) {
+        await peer.setRemoteDescription(new RTCSessionDescription(data.signal.sdp));
+        if (data.signal.sdp.type === 'offer') {
+          const answer = await peer.createAnswer();
+          await peer.setLocalDescription(answer);
+          socket.emit('signal', {
+            to: data.from,
+            signal: { sdp: answer }
+          });
+        }
+      }
+
+      if (data.signal.candidate) {
+        await peer.addIceCandidate(new RTCIceCandidate(data.signal.candidate));
+      }
+    });
+
+    socket.on('user-disconnected', (userId) => {
+      if (peers[userId]) {
+        peers[userId].close();
+        delete peers[userId];
+      }
+      removeRemoteVideo(userId);
+    });
+
+    // Switch camera function
+    async function switchCamera() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(device => device.kind === 'videoinput');
+
+      if (videoDevices.length > 1) {
+        const nextDevice = videoDevices.find(device => device.deviceId !== currentVideoDeviceId);
+        currentVideoDeviceId = nextDevice.deviceId;
+        await startStream();
+      }
+    }
+  </script>
+    <footer
+        style="position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); padding: 8px 16px; font-family: Arial, sans-serif; font-size: 14px; z-index: 1000;">
+        Created by <a href="http://www.sinzn.fun/" style="text-decoration: none; color: #0366d6;"> Shivam Singh </a> |
+        Source available on
+        <a href="https://github.com/sinzn" target="_blank" style="text-decoration: none; color: #0366d6;">GitHub</a>.
+    </footer>
+</body>
+</html>
